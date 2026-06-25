@@ -105,6 +105,20 @@ fn hex_to_u64(s string) !u64 {
 	return val
 }
 
+fn read_all_stdin() []u8 {
+	mut std_in := os.stdin()
+	mut data := []u8{}
+	mut buf := []u8{len: 4096}
+	for {
+		n := std_in.read(mut buf) or { 0 }
+		if n <= 0 {
+			break
+		}
+		data << buf[0..n]
+	}
+	return data
+}
+
 fn main() {
 	args := os.args
 	if args.len < 3 {
@@ -155,7 +169,7 @@ fn main() {
 		}
 		exit(0)
 	}
-	
+
 	if args.len < 5 {
 		print_usage(args[0])
 		exit(1)
@@ -190,8 +204,8 @@ fn main() {
 
 fn print_usage(program_name string) {
 	eprintln('Usage:')
-	eprintln('  ${program_name} pack <input_file> <output_dir> <seed>')
-	eprintln('  ${program_name} unpack <input_dir> <output_file> <seed>')
+	eprintln('  ${program_name} pack <input_file_or_-> <output_dir> <seed>')
+	eprintln('  ${program_name} unpack <input_dir> <output_file_or_-> <seed>')
 	eprintln('  ${program_name} shred <target_dir> [options]')
 	eprintln('\nOptions for shred:')
 	eprintln('  -n <passes>  Number of random overwrite iterations (default: 3)')
@@ -201,18 +215,24 @@ fn print_usage(program_name string) {
 }
 
 fn pack(file_path string, output_dir string, seed u64) ! {
-	if !os.exists(file_path) {
-		return error('File not found')
-	}
-	if os.is_dir(file_path) {
-		return error('Path is a directory')
+	mut data := []u8{}
+	
+	if file_path == '-' {
+		data = read_all_stdin()
+	} else {
+		if !os.exists(file_path) {
+			return error('File not found')
+		}
+		if os.is_dir(file_path) {
+			return error('Path is a directory')
+		}
+		data = os.read_bytes(file_path) or {
+			return error('Read failed')
+		}
 	}
 
-	data := os.read_bytes(file_path) or {
-		return error('Read failed')
-	}
 	if data.len == 0 {
-		return error('Empty file')
+		return error('Empty input data')
 	}
 
 	if os.exists(output_dir) {
@@ -236,7 +256,7 @@ fn pack(file_path string, output_dir string, seed u64) ! {
 
 	for i := 0; i < data.len; i += chunk_size {
 		end := if i + chunk_size < data.len { i + chunk_size } else { data.len }
-		chunk := data[i..end]
+		chunk := data[i..end].clone()
 
 		enc_index := encrypt_u64(index, seed)
 		enc_chunk := crypt_chunk(chunk, index, seed)
@@ -312,12 +332,18 @@ fn unpack(input_dir string, output_file string, seed u64) ! {
 		}
 		output_bytes << chunks_map[i]
 	}
-
-	os.write_bytes(output_file, output_bytes) or {
-		return error('Write failed')
+	
+	if output_file == '-' {
+		mut out := os.stdout()
+		out.write(output_bytes) or {
+			return error('Write to stdout failed')
+		}
+	} else {
+		os.write_bytes(output_file, output_bytes) or {
+			return error('Write failed')
+		}
+		println('Success: Unpacked successfully')
 	}
-
-	println('Success: Unpacked successfully')
 }
 
 fn shred(target_dir string, iterations int, zero_final bool, remove bool, verbose bool) ! {
@@ -358,7 +384,7 @@ fn shred(target_dir string, iterations int, zero_final bool, remove bool, verbos
 		if verbose {
 			println('Shredding metadata node ${i + 1}/${subdirs.len} (Current Name: ${current_name})...')
 		}
-		
+
 		for pass := 1; pass <= iterations; pass++ {
 			mut rand_name := ''
 			for _ in 0 .. original_len {
@@ -373,7 +399,7 @@ fn shred(target_dir string, iterations int, zero_final bool, remove bool, verbos
 			path = new_path
 			current_name = rand_name
 		}
-		
+
 		if zero_final {
 			if verbose {
 				println('  Final pass: Writing zero pattern...')
@@ -387,7 +413,7 @@ fn shred(target_dir string, iterations int, zero_final bool, remove bool, verbos
 			path = new_path
 			current_name = zero_name
 		}
-		
+
 		if remove {
 			if verbose {
 				println('  Truncating metadata index sequence...')
@@ -408,7 +434,7 @@ fn shred(target_dir string, iterations int, zero_final bool, remove bool, verbos
 			}
 		}
 	}
-	
+
 	if remove {
 		if verbose {
 			println('Removing parent container directory: ${target_dir}')
