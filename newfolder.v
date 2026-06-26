@@ -1,6 +1,7 @@
 import os
 import rand
 import encoding.hex
+import crypto.argon2
 
 struct PRNG {
 mut:
@@ -15,13 +16,21 @@ fn (mut p PRNG) next_byte() u8 {
 	return u8(z ^ (z >> 31))
 }
 
-fn hash_string_to_u64(s string) u64 {
-	mut hash := u64(0xcbf29ce484222325)
-	for b in s.bytes() {
-		hash ^= u64(b)
-		hash *= 0x100000001b3
+fn derive_seed_argon2(passphrase string, salt string, time u32, memory u32, threads u8) !u64 {
+	mut salt_bytes := salt.bytes()
+	if salt_bytes.len < 8 {
+		salt_bytes << []u8{len: 8 - salt_bytes.len, init: 0x00}
 	}
-	return hash
+	
+	hash_bytes := argon2.d_key(passphrase.bytes(), salt_bytes, time, memory, threads, 8) or {
+		return error('Argon2 key derivation failed: ${err}')
+	}
+
+	mut val := u64(0)
+	for i in 0 .. 8 {
+		val = (val << 8) | u64(hash_bytes[i])
+	}
+	return val
 }
 
 fn f(r u32, k u64) u32 {
@@ -183,8 +192,58 @@ fn main() {
 		eprintln('Error: Empty seed')
 		exit(1)
 	}
-
-	seed := hash_string_to_u64(seed_str)
+	
+	mut time_cost := u32(3)
+	mut memory_cost := u32(65536)
+	mut parallelism := u8(4)
+	mut salt_str := 'default_salt_value_123'
+	
+	for i := 5; i < args.len; i++ {
+		match args[i] {
+			'-t' {
+				if i + 1 < args.len {
+					time_cost = u32(args[i + 1].int())
+					if time_cost <= 0 {
+						time_cost = 3
+					}
+					i++
+				}
+			}
+			'-m' {
+				if i + 1 < args.len {
+					memory_cost = u32(args[i + 1].int())
+					if memory_cost <= 0 {
+						memory_cost = 65536
+					}
+					i++
+				}
+			}
+			'-p' {
+				if i + 1 < args.len {
+					parallelism = u8(args[i + 1].int())
+					if parallelism <= 0 {
+						parallelism = 4
+					}
+					i++
+				}
+			}
+			'-salt' {
+				if i + 1 < args.len {
+					salt_str = args[i + 1]
+					i++
+				}
+			}
+			else {
+				eprintln('Error: Unknown pack/unpack option: ${args[i]}')
+				exit(1)
+			}
+		}
+	}
+	
+	seed := derive_seed_argon2(seed_str, salt_str, time_cost, memory_cost, parallelism) or {
+		eprintln('Error: ${err}')
+		exit(1)
+	}
 
 	if action == 'pack' {
 		pack(param1, param2, seed) or {
@@ -204,9 +263,14 @@ fn main() {
 
 fn print_usage(program_name string) {
 	eprintln('Usage:')
-	eprintln('  ${program_name} pack <input_file_or_-> <output_dir> <seed>')
-	eprintln('  ${program_name} unpack <input_dir> <output_file_or_-> <seed>')
+	eprintln('  ${program_name} pack <input_file_or_-> <output_dir> <passphrase> [argon2 options]')
+	eprintln('  ${program_name} unpack <input_dir> <output_file_or_-> <passphrase> [argon2 options]')
 	eprintln('  ${program_name} shred <target_dir> [options]')
+	eprintln('\nOptions for pack/unpack (Argon2 Key Derivation):')
+	eprintln('  -t <time>    Time cost / iterations (default: 3)')
+	eprintln('  -m <memory>  Memory cost in KiB (default: 65536)')
+	eprintln('  -p <threads> Parallelism / degree of threads (default: 4)')
+	eprintln('  -salt <salt> Custom salt string (default: "default_salt_value_123")')
 	eprintln('\nOptions for shred:')
 	eprintln('  -n <passes>  Number of random overwrite iterations (default: 3)')
 	eprintln('  -z           Add a final overwrite pass with zeros')
