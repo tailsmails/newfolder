@@ -20,29 +20,40 @@ completely purge filesystem-level traces.
 ### 2. Cryptographic Core, AEAD, & Decoy Injection
 
   - **Domain-Separated Argon2 Key Derivation:** Implements memory-hard RFC 9106 Argon2-based key derivation to derive two distinct 256-bit symmetric keys using independent cryptographic salts:
-    - **Data Key ($K_{\text{data}}$):** Derived from the user's secret passphrase to encrypt chunk data.
-    - **Metadata Key ($K_{\text{meta}}$):** Derived from the separate user-provided seed string to generate the 64-bit Feistel indexing seed.
-  - **Custom 64-bit Feistel Cipher:** Obfuscates chunk sequence indices through a custom 4-round Feistel-like network, preventing sequential pattern analysis on directory listings.
+    - **Data Key (`K_data`):** Derived from the user's secret passphrase to encrypt chunk data.
+    - **Metadata Key (`K_meta`):** Derived from the separate user-provided seed string to generate the 64-bit Feistel indexing seed.
+  - **Custom 64-bit Feistel Cipher:** Obfuscates chunk sequence indices through a custom 4-round Feistel-like network, preventing pattern detection or sequence analysis on directory listings.
       - *Round Function Execution:* Implements a non-linear mixing function:
-        $$f(r, k) = ((r \oplus k) \times \text{0x27d4eb2d}) \oplus (r \gg 15)$$
-        with round keys scheduled from the Argon2-derived 64-bit metadata seed.
+        ```math
+        f(r, k) = ((r \oplus k) \times \text{0x27d4eb2d}) \oplus (r \gg 15)
+        ```
+        with deterministic round keys scheduled from the Argon2-derived 64-bit metadata seed.
   - **ChaCha20-Poly1305 AEAD Engine:** Encrypts 50-byte compressed chunks in-place using ChaCha20-Poly1305 authenticated encryption. Each block receives:
     - **Confidentiality:** Via ChaCha20 stream encryption.
     - **Integrity & Authenticity:** Via a 16-byte Poly1305 MAC tag appended to the ciphertext.
-    - **Deterministic Nonce Derivation:** The 12-byte initialization vector (nonce) is derived deterministically from the block index, guaranteeing that every block uses a unique nonce under the same key without storing the nonce in the filename.
+    - **Deterministic Nonce Derivation:** The 12-byte initialization vector (nonce) is derived deterministically from the block index, guaranteeing that every block uses a unique nonce under the same key:
+        ```math
+        S_{chunk} = \text{Seed} \oplus \text{Index}
+        ```
   - **Indistinguishable Decoy (Fake) Block Injection:** Generates a randomized number of decoy files (between 1x and 2x the genuine chunk count) alongside the real files.
     - *Stealth Alignment:* Decoy filenames match the exact layout of genuine files (16 hex characters for the index + 132 hex characters representing a 50-byte chunk and 16-byte MAC tag).
-    - *Silent Filtering:* During unpacking, fake files are isolated. Decrypting a fake filename's index yields a random out-of-bounds index value ($index \ge \text{directory file count}$). If a decoy index lands in-bounds by statistical anomaly, its Poly1305 MAC verification fails. In both cases, decoys are silently ignored during reconstruction.
+    - *Silent Filtering:* During unpacking, fake files are isolated. Decrypting a fake filename's index yields a random out-of-bounds index value:
+        ```math
+        \text{Index} \ge \text{Directory File Count}
+        ```
+        If a decoy index lands in-bounds by statistical anomaly, its Poly1305 MAC verification fails. In both cases, decoys are silently ignored during reconstruction.
 
 ### 3. Progressive File-Metadata Shredder Engine (GNU-Shred Compliance)
 
   - **Multi-Pass Directory-Entry Saturation (DES):** Overwrites directory-resident filenames in-place with randomized alphanumeric sequences of identical length, neutralizing original filename signatures on disk.
-      - *In-Place Scrambling:* Replaces filename record allocations $N$ times with high-entropy alphanumeric noise, ensuring previous names cannot be retrieved via filesystem journal carving or undelete forensics.
+      - *In-Place Scrambling:* Replaces filename record allocations `N` times with high-entropy alphanumeric noise, ensuring previous names cannot be retrieved via filesystem journal carving or undelete forensics.
   - **Zero-Fill Obfuscation (`-z`):** Appends an optional final pass that overwrites all filename entries with homogeneous '0' character strings.
       - *Pattern Obfuscation:* Masks high-entropy random name patterns with uniform sequences, leaving directory index tables populated with innocent-looking zeroed metadata slots.
   - **Logarithmic Name Contraction & Unlinking (`-u`):** Progressively halves the character length of renamed filenames before executing the final file unlink (`rm`) system call.
       - *Slack Space Elimination:* Successively shrinks filenames to force the filesystem to actively clear and overwrite trailing index record slack spaces:
-        $$\text{Length}(N_{k+1}) = \lfloor \text{Length}(N_k) / 2 \rfloor$$
+        ```math
+        \text{Length}(N_{k+1}) = \lfloor \text{Length}(N_k) / 2 \rfloor
+        ```
 
 ---
 
@@ -122,27 +133,39 @@ newfolder shred ./vault -n 5 -z -u -v
 
 1.  **Dual-Key Derivation Pipeline:**
     
-    $$\text{Passphrase} + (\text{Salt} + \text{"\_data"}) \xrightarrow{\text{Argon2}} K_{\text{data}} \quad (256\text{-bit Data Key})$$
+    ```math
+    \text{Passphrase} + \text{Salt-data} \to K_{data} \quad \text{(256-bit Data Key)}
+    ```
     
-    $$\text{Seed String} + (\text{Salt} + \text{"\_metadata"}) \xrightarrow{\text{Argon2}} K_{\text{meta}} \quad (256\text{-bit Metadata Key}) \rightarrow \text{64-bit Feistel Seed}$$
+    ```math
+    \text{Seed String} + \text{Salt-metadata} \to K_{meta} \quad \text{(256-bit Metadata Key)} \to \text{64-bit Feistel Seed}
+    ```
 
 2.  **Block Transition Map:**
     
-    $$\text{Physical File} \xrightarrow{\text{Zstd L19}} \text{Compressed Payload} \rightarrow \text{Chunking } [50\text{B}] \rightarrow \begin{cases} \text{Feistel Index Cipher } (K_{\text{meta}}) \\ \text{ChaCha20-Poly1305 } (K_{\text{data}}) \end{cases} \rightarrow \text{OS Directory Entry}$$
+    ```math
+    \text{Physical File} \to \text{Zstd L19} \to \text{Compressed Payload} \to \text{Chunks} \to \text{Encryption (ChaCha20-Poly1305)} \to \text{OS Directory Entry}
+    ```
 
 3.  **Entropy Alignment (Real vs. Decoys):**
     
-    $$\text{Directory Output} = \{\text{Real Blocks}\} \cup \{\text{Decoy Blocks (Random Hex Layout)}\}$$
+    ```math
+    \text{Directory Output} = \{\text{Real Blocks}\} \cup \{\text{Decoy Blocks}\}
+    ```
 
 4.  **Metadata Overwrite Formula:**
-    Each directory-resident filename $N$ of original length $L$ is overwritten with random bytes from the alphanumeric charset $\Sigma$ for $J$ iterations:
+    Each directory-resident filename `N` of original length `L` is overwritten with random bytes from the alphanumeric charset Σ for `J` iterations:
     
-    $$N_{j} \in \Sigma^L \quad \text{for } j \in [1, \text{passes}]$$
+    ```math
+    N_{j} \in \Sigma^L \quad \text{for } j \in [1, \text{passes}]
+    ```
 
 5.  **Destruction Cycle:**
     If the `-u` parameter is enabled, the filename namespace is shrunk and unlinked:
     
-    $$\text{Random Scramble} \rightarrow \text{Zero-Fill } [0^L] \rightarrow \text{Logarithmic Contraction} \rightarrow \text{System Unlink } (\text{rm})$$
+    ```math
+    \text{Random Scramble} \to \text{Zero-Fill } [0^L] \to \text{Logarithmic Contraction} \to \text{System Unlink (rm)}
+    ```
 
 ---
 
