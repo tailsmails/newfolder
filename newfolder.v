@@ -144,15 +144,13 @@ fn main() {
 		mut zero_final := false
 		mut remove := false
 		mut verbose := false
+		mut journal_count := 0 
 
 		for i := 3; i < args.len; i++ {
 			match args[i] {
 				'-n' {
 					if i + 1 < args.len {
 						iterations = args[i + 1].int()
-						if iterations <= 0 {
-							iterations = 3
-						}
 						i++
 					}
 				}
@@ -165,6 +163,12 @@ fn main() {
 				'-v' {
 					verbose = true
 				}
+				'-j' {
+					if i + 1 < args.len {
+						journal_count = args[i + 1].int()
+						i++
+					}
+				}
 				else {
 					eprintln('Error: Unknown shred option: ${args[i]}')
 					exit(1)
@@ -172,7 +176,7 @@ fn main() {
 			}
 		}
 
-		shred(target_dir, iterations, zero_final, remove, verbose) or {
+		shred(target_dir, iterations, zero_final, remove, verbose, journal_count) or {
 			eprintln('Error: ${err}')
 			exit(1)
 		}
@@ -265,7 +269,7 @@ fn print_usage(program_name string) {
 	eprintln('Usage:')
 	eprintln('  ${program_name} pack <input_file_or_-> <output_dir> <passphrase> [argon2 options]')
 	eprintln('  ${program_name} unpack <input_dir> <output_file_or_-> <passphrase> [argon2 options]')
-	eprintln('  ${program_name} shred <target_dir> [options]')
+	eprintln('  ${program_name} shred <target_path> [options]')
 	eprintln('\nOptions for pack/unpack (Argon2 Key Derivation):')
 	eprintln('  -t <time>    Time cost / iterations (default: 3)')
 	eprintln('  -m <memory>  Memory cost in KiB (default: 65536)')
@@ -276,6 +280,7 @@ fn print_usage(program_name string) {
 	eprintln('  -z           Add a final overwrite pass with zeros')
 	eprintln('  -u           Deallocate and remove files after shredding')
 	eprintln('  -v           Verbose output (print progress)')
+	eprintln('  -j <count>   Journal saturation file count (default: 0 for auto-detect, fallback to 1500)')
 }
 
 fn pack(file_path string, output_dir string, seed u64) ! {
@@ -408,23 +413,144 @@ fn unpack(input_dir string, output_file string, seed u64) ! {
 	}
 }
 
-fn shred(target_dir string, iterations int, zero_final bool, remove bool, verbose bool) ! {
-	if !os.exists(target_dir) || !os.is_dir(target_dir) {
-		return error('Target is not a valid directory: ${target_dir}')
+fn generate_random_dir_name() string {
+	charset := 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+	mut rand_name := '.cache_'
+	for _ in 0 .. 10 {
+		rand_idx := rand.intn(charset.len) or { 0 }
+		rand_name += charset[rand_idx..rand_idx+1]
+	}
+	return rand_name
+}
+
+fn saturate_journal(target_path string, verbose bool, user_count int) ! {
+	if verbose {
+		println('Starting safe journal saturation...')
 	}
 
-	items := os.ls(target_dir) or { return err }
-	mut target_files := []string{}
-	for item in items {
-		full_path := os.join_path(target_dir, item)
-		if os.is_file(full_path) {
-			target_files << full_path
+	mut num_files := u64(0)
+
+	if user_count > 0 {
+		num_files = u64(user_count)
+		if verbose {
+			println('  Using user-specified transaction count: ${num_files}')
+		}
+	} else {
+		mut journal_size_mb := u64(16)
+		mut block_size_bytes := u64(4096)
+		mut detected := false
+
+		df_res := os.execute('df -P "${target_path}"')
+		if df_res.exit_code == 0 {
+			lines := df_res.output.split_into_lines()
+			if lines.len >= 2 {
+				parts := lines[1].fields()
+				if parts.len > 0 {
+					partition := parts[0]
+					
+					mut dump_res := os.execute('dumpe2fs -h "${partition}" 2>/dev/null')
+					
+					if dump_res.exit_code != 0 {
+						dump_res = os.execute('tune2fs -l "${partition}" 2>/dev/null')
+					}
+
+					if dump_res.exit_code == 0 {
+						dump_lines := dump_res.output.split_into_lines()
+						for line in dump_lines {
+							line_lower := line.to_lower()
+							if line_lower.contains('journal size') {
+								words := line.split(':')
+								if words.len > 1 {
+									val_str := words[1].trim_space().replace('M', '').replace('K', '')
+									val := val_str.int()
+									if val > 0 {
+										journal_size_mb = u64(val)
+										detected = true
+									}
+								}
+							} else if line_lower.contains('block size') {
+								words := line.split(':')
+								if words.len > 1 {
+									val := words[1].trim_space().int()
+									if val > 0 {
+										block_size_bytes = u64(val)
+										detected = true
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		if detected {
+			total_journal_blocks := (journal_size_mb * 1024 * 1024) / block_size_bytes
+			num_files = total_journal_blocks / 2
+			if verbose {
+				println('  Auto-detected - Journal Size: ${journal_size_mb}MB, Block Size: ${block_size_bytes} bytes')
+			}
+		} else {
+			num_files = 1500
+			if verbose {
+				println('  System tools missing or error. Using safe default transaction count: ${num_files}')
+			}
 		}
 	}
 
+	dummy_name := generate_random_dir_name()
+	dummy_dir := os.join_path(target_path, dummy_name)
+
+	os.mkdir(dummy_dir) or {
+		return error('Failed to create stealthy folder: ${err}')
+	}
+
+	if verbose {
+		println('  Generating dummy metadata in ${dummy_name}...')
+	}
+	for i in 0 .. num_files {
+		file_path := os.join_path(dummy_dir, 'd_${i}')
+		os.write_file(file_path, '') or { break }
+	}
+
+	os.execute('sync')
+
+	if verbose {
+		println('  Cleaning dummy metadata...')
+	}
+	os.rmdir_all(dummy_dir) or {
+		return error('Failed to remove dummy folder: ${err}')
+	}
+
+	os.execute('sync')
+
+	if verbose {
+		println('Journal saturation complete.')
+	}
+}
+
+fn shred(target string, iterations int, zero_final bool, remove bool, verbose bool, journal_count int) ! {
+	mut target_files := []string{}
+	mut is_dir := false
+
+	if os.is_dir(target) {
+		is_dir = true
+		items := os.ls(target) or { return err }
+		for item in items {
+			full_path := os.join_path(target, item)
+			if os.is_file(full_path) {
+				target_files << full_path
+			}
+		}
+	} else if os.is_file(target) {
+		target_files << target
+	} else {
+		return error('Target does not exist or is not accessible: ${target}')
+	}
+
 	if target_files.len == 0 {
-		if remove {
-			os.rmdir(target_dir) or { return err }
+		if remove && is_dir {
+			os.rmdir(target) or { return err }
 			if verbose {
 				println('Target directory was already empty and has been removed.')
 			}
@@ -439,6 +565,9 @@ fn shred(target_dir string, iterations int, zero_final bool, remove bool, verbos
 	charset := 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
 
 	for i, mut path in target_files {
+		if !os.exists(path) {
+			continue
+		}
 		dir_path := os.dir(path)
 		mut current_name := os.file_name(path)
 		original_len := current_name.len
@@ -446,7 +575,7 @@ fn shred(target_dir string, iterations int, zero_final bool, remove bool, verbos
 		if verbose {
 			println('Shredding metadata node ${i + 1}/${target_files.len} (Current Name: ${current_name})...')
 		}
-
+		
 		for pass := 1; pass <= iterations; pass++ {
 			mut rand_name := ''
 			for _ in 0 .. original_len {
@@ -456,12 +585,12 @@ fn shred(target_dir string, iterations int, zero_final bool, remove bool, verbos
 			
 			new_path := os.join_path(dir_path, rand_name)
 			os.rename(path, new_path) or {
-				break
+				continue
 			}
 			path = new_path
 			current_name = rand_name
 		}
-
+		
 		if zero_final {
 			if verbose {
 				println('  Final pass: Writing zero pattern...')
@@ -471,11 +600,14 @@ fn shred(target_dir string, iterations int, zero_final bool, remove bool, verbos
 				zero_name += '0'
 			}
 			new_path := os.join_path(dir_path, zero_name)
-			os.rename(path, new_path) or {}
+			os.rename(path, new_path) or {
+				unsafe { goto skip_zero }
+			}
 			path = new_path
 			current_name = zero_name
+			skip_zero:
 		}
-
+		
 		if remove {
 			if verbose {
 				println('  Truncating metadata index sequence...')
@@ -492,17 +624,27 @@ fn shred(target_dir string, iterations int, zero_final bool, remove bool, verbos
 				println('  Unlinking file...')
 			}
 			os.rm(path) or {
-				eprintln('Failed to remove file: ${path}')
+				return error('Failed to remove file: ${path} (${err})')
 			}
 		}
 	}
-
+	
 	if remove {
-		if verbose {
-			println('Removing parent container directory: ${target_dir}')
-		}
-		os.rmdir(target_dir) or {
-			return error('Failed to remove root parent directory')
+		if is_dir {
+			parent_dir := os.dir(os.real_path(target))
+
+			if verbose {
+				println('Removing parent container directory: ${target}')
+			}
+			os.rmdir(target) or {
+				return error('Failed to remove root parent directory: ${target} (${err})')
+			}
+
+			saturate_journal(parent_dir, verbose, journal_count) or {
+				if verbose {
+					eprintln('Warning: Journal saturation encountered an issue: ${err}')
+				}
+			}
 		}
 	}
 
