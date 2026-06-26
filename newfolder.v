@@ -2,6 +2,8 @@ import os
 import rand
 import encoding.hex
 import crypto.argon2
+import compress.zstd
+import x.crypto.chacha20poly1305
 
 struct PRNG {
 mut:
@@ -16,21 +18,16 @@ fn (mut p PRNG) next_byte() u8 {
 	return u8(z ^ (z >> 31))
 }
 
-fn derive_seed_argon2(passphrase string, salt string, time u32, memory u32, threads u8) !u64 {
+fn derive_key_argon2(passphrase string, salt string, time u32, memory u32, threads u8) ![]u8 {
 	mut salt_bytes := salt.bytes()
 	if salt_bytes.len < 8 {
 		salt_bytes << []u8{len: 8 - salt_bytes.len, init: 0x00}
 	}
 	
-	hash_bytes := argon2.d_key(passphrase.bytes(), salt_bytes, time, memory, threads, 8) or {
+	hash_bytes := argon2.d_key(passphrase.bytes(), salt_bytes, time, memory, threads, 32) or {
 		return error('Argon2 key derivation failed: ${err}')
 	}
-
-	mut val := u64(0)
-	for i in 0 .. 8 {
-		val = (val << 8) | u64(hash_bytes[i])
-	}
-	return val
+	return hash_bytes
 }
 
 fn f(r u32, k u64) u32 {
@@ -81,13 +78,32 @@ fn decrypt_u64(val u64, seed u64) u64 {
 	return (u64(l) << 32) | u64(r)
 }
 
-fn crypt_chunk(chunk []u8, index u64, seed u64) []u8 {
-	mut prng := PRNG{state: seed ^ index}
-	mut result := []u8{cap: chunk.len}
-	for b in chunk {
-		result << b ^ prng.next_byte()
+fn make_nonce(index u64) []u8 {
+	mut nonce := []u8{len: 12}
+	mut temp := index
+	for i := 7; i >= 0; i-- {
+		nonce[i] = u8(temp & 0xff)
+		temp >>= 8
 	}
-	return result
+	return nonce
+}
+
+fn encrypt_chunk_chacha(chunk []u8, index u64, key []u8) ![]u8 {
+	nonce := make_nonce(index)
+	aad := []u8{}
+	ciphertext := chacha20poly1305.encrypt(chunk, key, nonce, aad) or {
+		return error('Encryption failed')
+	}
+	return ciphertext
+}
+
+fn decrypt_chunk_chacha(enc_chunk []u8, index u64, key []u8) ![]u8 {
+	nonce := make_nonce(index)
+	aad := []u8{}
+	plaintext := chacha20poly1305.decrypt(enc_chunk, key, nonce, aad) or {
+		return error('Decryption or integrity check failed')
+	}
+	return plaintext
 }
 
 fn u64_to_hex(val u64) string {
@@ -183,17 +199,18 @@ fn main() {
 		exit(0)
 	}
 
-	if args.len < 5 {
+	if args.len < 6 {
 		print_usage(args[0])
 		exit(1)
 	}
 
 	param1 := args[2]
 	param2 := args[3]
-	seed_str := args[4]
+	passphrase := args[4]
+	seed_str := args[5]
 
-	if seed_str.len == 0 {
-		eprintln('Error: Empty seed')
+	if passphrase.len == 0 || seed_str.len == 0 {
+		eprintln('Error: Empty passphrase or seed')
 		exit(1)
 	}
 	
@@ -202,7 +219,7 @@ fn main() {
 	mut parallelism := u8(4)
 	mut salt_str := 'default_salt_value_123'
 	
-	for i := 5; i < args.len; i++ {
+	for i := 6; i < args.len; i++ {
 		match args[i] {
 			'-t' {
 				if i + 1 < args.len {
@@ -244,18 +261,28 @@ fn main() {
 		}
 	}
 	
-	seed := derive_seed_argon2(seed_str, salt_str, time_cost, memory_cost, parallelism) or {
+	data_key := derive_key_argon2(passphrase, salt_str + '_data', time_cost, memory_cost, parallelism) or {
 		eprintln('Error: ${err}')
 		exit(1)
 	}
 
+	metadata_key := derive_key_argon2(seed_str, salt_str + '_metadata', time_cost, memory_cost, parallelism) or {
+		eprintln('Error: ${err}')
+		exit(1)
+	}
+
+	mut seed := u64(0)
+	for i in 0 .. 8 {
+		seed = (seed << 8) | u64(metadata_key[i])
+	}
+
 	if action == 'pack' {
-		pack(param1, param2, seed) or {
+		pack(param1, param2, data_key, seed) or {
 			eprintln('Error: ${err}')
 			exit(1)
 		}
 	} else if action == 'unpack' {
-		unpack(param1, param2, seed) or {
+		unpack(param1, param2, data_key, seed) or {
 			eprintln('Error: ${err}')
 			exit(1)
 		}
@@ -267,8 +294,8 @@ fn main() {
 
 fn print_usage(program_name string) {
 	eprintln('Usage:')
-	eprintln('  ${program_name} pack <input_file_or_-> <output_dir> <passphrase> [argon2 options]')
-	eprintln('  ${program_name} unpack <input_dir> <output_file_or_-> <passphrase> [argon2 options]')
+	eprintln('  ${program_name} pack <input_file_or_-> <output_dir> <passphrase> <seed> [argon2 options]')
+	eprintln('  ${program_name} unpack <input_dir> <output_file_or_-> <passphrase> <seed> [argon2 options]')
 	eprintln('  ${program_name} shred <target_path> [options]')
 	eprintln('\nOptions for pack/unpack (Argon2 Key Derivation):')
 	eprintln('  -t <time>    Time cost / iterations (default: 3)')
@@ -283,7 +310,7 @@ fn print_usage(program_name string) {
 	eprintln('  -j <count>   Journal saturation file count (default: 0 for auto-detect, fallback to 1500)')
 }
 
-fn pack(file_path string, output_dir string, seed u64) ! {
+fn pack(file_path string, output_dir string, data_key []u8, seed u64) ! {
 	mut data := []u8{}
 	
 	if file_path == '-' {
@@ -302,6 +329,10 @@ fn pack(file_path string, output_dir string, seed u64) ! {
 
 	if data.len == 0 {
 		return error('Empty input data')
+	}
+	
+	compressed_data := zstd.compress(data, compression_level: 19) or {
+		return error('Zstd compression failed: ${err}')
 	}
 
 	if os.exists(output_dir) {
@@ -323,12 +354,14 @@ fn pack(file_path string, output_dir string, seed u64) ! {
 	chunk_size := 50
 	mut index := u64(0)
 
-	for i := 0; i < data.len; i += chunk_size {
-		end := if i + chunk_size < data.len { i + chunk_size } else { data.len }
-		chunk := data[i..end].clone()
+	for i := 0; i < compressed_data.len; i += chunk_size {
+		end := if i + chunk_size < compressed_data.len { i + chunk_size } else { compressed_data.len }
+		chunk := compressed_data[i..end].clone()
 
 		enc_index := encrypt_u64(index, seed)
-		enc_chunk := crypt_chunk(chunk, index, seed)
+		enc_chunk := encrypt_chunk_chacha(chunk, index, data_key) or {
+			return error('Failed to encrypt chunk: ${err}')
+		}
 		file_name := u64_to_hex(enc_index) + enc_chunk.hex()
 		file_path_out := os.join_path(output_dir, file_name)
 
@@ -340,11 +373,41 @@ fn pack(file_path string, output_dir string, seed u64) ! {
 		}
 		index++
 	}
+	
+	mut limit := int(index)
+	if limit <= 0 {
+		limit = 1
+	}
+	num_fake_files := (rand.intn(limit) or { 0 }) + int(index)
+	charset := '0123456789abcdef'
+	
+	for _ in 0 .. num_fake_files {
+		mut fake_enc_index := ''
+		for _ in 0 .. 16 {
+			idx := rand.intn(charset.len) or { 0 }
+			fake_enc_index += charset[idx..idx+1]
+		}
+		mut fake_enc_chunk := ''
+		for _ in 0 .. 132 {
+			idx := rand.intn(charset.len) or { 0 }
+			fake_enc_chunk += charset[idx..idx+1]
+		}
+		
+		fake_file_name := fake_enc_index + fake_enc_chunk
+		fake_file_path := os.join_path(output_dir, fake_file_name)
+		
+		if os.exists(fake_file_path) {
+			continue
+		}
+		os.write_file(fake_file_path, '') or {
+			continue
+		}
+	}
 
-	println('Success: Packed ${index} blocks')
+	println('Success: Packed ${index} real blocks and ${num_fake_files} decoy blocks.')
 }
 
-fn unpack(input_dir string, output_file string, seed u64) ! {
+fn unpack(input_dir string, output_file string, data_key []u8, seed u64) ! {
 	if !os.exists(input_dir) {
 		return error('Directory not found')
 	}
@@ -359,7 +422,7 @@ fn unpack(input_dir string, output_file string, seed u64) ! {
 	mut chunks_map := map[u64][]u8{}
 
 	for item in items {
-		if item.len < 18 {
+		if item.len < 50 {
 			continue
 		}
 
@@ -371,9 +434,9 @@ fn unpack(input_dir string, output_file string, seed u64) ! {
 		}
 
 		index := decrypt_u64(enc_index, seed)
-
+		
 		if index >= u64(items.len) {
-			return error('Invalid seed')
+			continue
 		}
 
 		enc_chunk := hex.decode(enc_chunk_hex) or {
@@ -381,35 +444,41 @@ fn unpack(input_dir string, output_file string, seed u64) ! {
 		}
 
 		if index in chunks_map {
-			return error('Duplicate index')
+			continue
 		}
-
-		chunk := crypt_chunk(enc_chunk, index, seed)
+		
+		chunk := decrypt_chunk_chacha(enc_chunk, index, data_key) or {
+			continue
+		}
 		chunks_map[index] = chunk
 	}
 
 	if chunks_map.len == 0 {
-		return error('No data found')
+		return error('No valid blocks found. Incorrect passphrase/seed or corrupted data.')
 	}
-
-	mut output_bytes := []u8{}
+	
+	mut compressed_bytes := []u8{}
 	for i := u64(0); i < u64(chunks_map.len); i++ {
 		if i !in chunks_map {
-			return error('Missing block')
+			return error('Missing block sequence at index ${i}. The archive is incomplete.')
 		}
-		output_bytes << chunks_map[i]
+		compressed_bytes << chunks_map[i]
+	}
+	
+	decompressed_bytes := zstd.decompress(compressed_bytes) or {
+		return error('Zstd decompression failed. The data might be corrupted.')
 	}
 	
 	if output_file == '-' {
 		mut out := os.stdout()
-		out.write(output_bytes) or {
+		out.write(decompressed_bytes) or {
 			return error('Write to stdout failed')
 		}
 	} else {
-		os.write_bytes(output_file, output_bytes) or {
+		os.write_bytes(output_file, decompressed_bytes) or {
 			return error('Write failed')
 		}
-		println('Success: Unpacked successfully')
+		println('Success: Unpacked and decompressed successfully')
 	}
 }
 
