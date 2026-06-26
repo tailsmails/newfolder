@@ -210,7 +210,7 @@ fn print_usage(program_name string) {
 	eprintln('\nOptions for shred:')
 	eprintln('  -n <passes>  Number of random overwrite iterations (default: 3)')
 	eprintln('  -z           Add a final overwrite pass with zeros')
-	eprintln('  -u           Deallocate and remove directories after shredding')
+	eprintln('  -u           Deallocate and remove files after shredding')
 	eprintln('  -v           Verbose output (print progress)')
 }
 
@@ -260,16 +260,14 @@ fn pack(file_path string, output_dir string, seed u64) ! {
 
 		enc_index := encrypt_u64(index, seed)
 		enc_chunk := crypt_chunk(chunk, index, seed)
+		file_name := u64_to_hex(enc_index) + enc_chunk.hex()
+		file_path_out := os.join_path(output_dir, file_name)
 
-		folder_name := u64_to_hex(enc_index) + enc_chunk.hex()
-		folder_path := os.join_path(output_dir, folder_name)
-
-		if os.exists(folder_path) {
-			return error('Folder exists')
+		if os.exists(file_path_out) {
+			return error('File exists')
 		}
-
-		os.mkdir(folder_path) or {
-			return error('Folder creation failed')
+		os.write_file(file_path_out, '') or {
+			return error('File creation failed')
 		}
 		index++
 	}
@@ -352,15 +350,15 @@ fn shred(target_dir string, iterations int, zero_final bool, remove bool, verbos
 	}
 
 	items := os.ls(target_dir) or { return err }
-	mut subdirs := []string{}
+	mut target_files := []string{}
 	for item in items {
 		full_path := os.join_path(target_dir, item)
-		if os.is_dir(full_path) {
-			subdirs << full_path
+		if os.is_file(full_path) {
+			target_files << full_path
 		}
 	}
 
-	if subdirs.len == 0 {
+	if target_files.len == 0 {
 		if remove {
 			os.rmdir(target_dir) or { return err }
 			if verbose {
@@ -371,18 +369,18 @@ fn shred(target_dir string, iterations int, zero_final bool, remove bool, verbos
 	}
 
 	if verbose {
-		println('Found ${subdirs.len} directories to shred. (Passes: ${iterations}, Zero-fill: ${zero_final}, Remove: ${remove})')
+		println('Found ${target_files.len} files to shred. (Passes: ${iterations}, Zero-fill: ${zero_final}, Remove: ${remove})')
 	}
 
 	charset := 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
 
-	for i, mut path in subdirs {
+	for i, mut path in target_files {
 		dir_path := os.dir(path)
 		mut current_name := os.file_name(path)
 		original_len := current_name.len
 
 		if verbose {
-			println('Shredding metadata node ${i + 1}/${subdirs.len} (Current Name: ${current_name})...')
+			println('Shredding metadata node ${i + 1}/${target_files.len} (Current Name: ${current_name})...')
 		}
 
 		for pass := 1; pass <= iterations; pass++ {
@@ -427,10 +425,10 @@ fn shred(target_dir string, iterations int, zero_final bool, remove bool, verbos
 			}
 
 			if verbose {
-				println('  Unlinking directory block...')
+				println('  Unlinking file...')
 			}
-			os.rmdir(path) or {
-				eprintln('Failed to remove directory: ${path}')
+			os.rm(path) or {
+				eprintln('Failed to remove file: ${path}')
 			}
 		}
 	}
